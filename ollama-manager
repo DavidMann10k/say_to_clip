@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONTAINER_NAME="${OLLAMA_CONTAINER_NAME:-ollama}"
+IMAGE="${OLLAMA_IMAGE:-ollama/ollama:latest}"
+VOLUME_NAME="${OLLAMA_VOLUME:-ollama}"
+HOST_BIND="${OLLAMA_BIND:-127.0.0.1}"
+HOST_PORT="${OLLAMA_PORT:-11434}"
+GPU_MODE="${OLLAMA_GPU:-auto}"
+DEFAULT_MODEL="${OLLAMA_DEFAULT_MODEL:-llama3.2}"
+
+COMMON_MODELS=(
+  "llama3.2"
+  "llama3.2:1b"
+  "qwen2.5:3b"
+  "qwen2.5:7b"
+  "gemma3:4b"
+  "gemma3:12b"
+)
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  ./ollama-manager start [--cpu|--gpu|--rocm|--vulkan|--nvidia|--recreate]
+  ./ollama-manager stop
+  ./ollama-manager restart [--cpu|--gpu|--rocm|--vulkan|--nvidia|--recreate]
+  ./ollama-manager status
+  ./ollama-manager logs
+  ./ollama-manager pull [MODEL]
+  ./ollama-manager choose
+  ./ollama-manager models
+  ./ollama-manager ps
+  ./ollama-manager remove
+  ./ollama-manager help
+
+Defaults:
+  container: ${CONTAINER_NAME}
+  image:     ${IMAGE}
+  volume:    ${VOLUME_NAME}
+  API:       http://${HOST_BIND}:${HOST_PORT}
+  model:     ${DEFAULT_MODEL}
+  GPU:       ${GPU_MODE}
+
+Environment overrides:
+  OLLAMA_CONTAINER_NAME, OLLAMA_IMAGE, OLLAMA_VOLUME, OLLAMA_BIND,
+  OLLAMA_PORT, OLLAMA_GPU=auto|never|rocm|vulkan|nvidia, OLLAMA_DEFAULT_MODEL
+EOF
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  docker info >/dev/null 2>&1 || die "docker is installed, but this user cannot access the Docker daemon"
+}
+
+container_exists() {
+  docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1
+}
+
+container_running() {
+  [ "$(docker container inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" = "true" ]
+}
+
+docker_has_nvidia_runtime() {
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'
+}
+
+host_has_nvidia_device() {
+  [ -e /dev/nvidiactl ] || [ -e /dev/nvidia0 ] || command -v nvidia-smi >/dev/null 2>&1
+}
+
+host_has_amd_device() {
+  [ -e /dev/kfd ] && [ -d /dev/dri ]
+}
+
+host_has_dri_device() {
+  [ -d /dev/dri ]
+}
+
+host_has_amd_pci() {
+  command -v lspci >/dev/null 2>&1 && lspci | grep -Eiq 'AMD/ATI|Radeon'
+}
+
+gpu_backend() {
+  case "$GPU_MODE" in
+    never) printf 'cpu' ;;
+    rocm|amd) printf 'rocm' ;;
+    vulkan) printf 'vulkan' ;;
+    nvidia) printf 'nvidia' ;;
+    auto)
+      if host_has_amd_device; then
+        printf 'rocm'
+      elif host_has_dri_device; then
+        printf 'vulkan'
+      elif docker_has_nvidia_runtime || host_has_nvidia_device; then
+        printf 'nvidia'
+      else
+        printf 'cpu'
+      fi
+      ;;
+    *) die "invalid OLLAMA_GPU value '${GPU_MODE}'; use auto, never, rocm, vulkan, or nvidia" ;;
+  esac
+}
+
+remove_existing_container() {
+  if container_exists; then
+    docker rm -f "$CONTAINER_NAME" >/dev/null
+  fi
+}
+
+run_container() {
+  local backend="$1"
+  local image="$IMAGE"
+  local args=(
+    run
+    -d
+    --name "$CONTAINER_NAME"
+    --restart unless-stopped
+    -p "${HOST_BIND}:${HOST_PORT}:11434"
+    -v "${VOLUME_NAME}:/root/.ollama"
+  )
+
+  case "$backend" in
+    nvidia)
+      args+=(--gpus all)
+      ;;
+    rocm)
+      args+=(--device /dev/kfd --device /dev/dri)
+      if [ "${OLLAMA_IMAGE:-}" = "" ]; then
+        image="ollama/ollama:rocm"
+      fi
+      ;;
+    vulkan)
+      args+=(--device /dev/dri -e OLLAMA_VULKAN=1)
+      ;;
+    cpu)
+      ;;
+    *) die "internal error: unknown GPU backend '${backend}'" ;;
+  esac
+
+  args+=("$image")
+  docker "${args[@]}"
+}
+
+start_container() {
+  local recreate="no"
+
+  while [ "${1:-}" != "" ]; do
+    case "$1" in
+      --cpu) GPU_MODE="never" ;;
+      --gpu) GPU_MODE="auto" ;;
+      --rocm|--amd) GPU_MODE="rocm" ;;
+      --vulkan) GPU_MODE="vulkan" ;;
+      --nvidia) GPU_MODE="nvidia" ;;
+      --recreate) recreate="yes" ;;
+      *) die "unknown start option: $1" ;;
+    esac
+    shift
+  done
+
+  require_docker
+
+  if [ "$recreate" = "yes" ]; then
+    remove_existing_container
+  fi
+
+  if container_running; then
+    info "Ollama is already running at http://${HOST_BIND}:${HOST_PORT}"
+    return
+  fi
+
+  if container_exists; then
+    docker start "$CONTAINER_NAME" >/dev/null
+    info "Started existing container '${CONTAINER_NAME}' at http://${HOST_BIND}:${HOST_PORT}"
+    return
+  fi
+
+  local backend
+  backend="$(gpu_backend)"
+
+  if [ "$backend" != "cpu" ]; then
+    info "Starting '${CONTAINER_NAME}' with ${backend} GPU support..."
+    if run_container "$backend" >/dev/null; then
+      info "Started Ollama at http://${HOST_BIND}:${HOST_PORT}"
+      return
+    fi
+
+    info "${backend} GPU start failed; retrying without GPU."
+    if [ "$backend" = "rocm" ] && host_has_amd_pci && ! host_has_amd_device; then
+      info "AMD GPU detected, but /dev/kfd and /dev/dri are not available to Docker."
+    fi
+    remove_existing_container
+  fi
+
+  info "Starting '${CONTAINER_NAME}' without GPU support..."
+  run_container cpu >/dev/null
+  info "Started Ollama at http://${HOST_BIND}:${HOST_PORT}"
+}
+
+stop_container() {
+  require_docker
+
+  if ! container_exists; then
+    info "No '${CONTAINER_NAME}' container exists."
+    return
+  fi
+
+  if ! container_running; then
+    info "'${CONTAINER_NAME}' is already stopped."
+    return
+  fi
+
+  docker stop "$CONTAINER_NAME" >/dev/null
+  info "Stopped '${CONTAINER_NAME}'."
+}
+
+restart_container() {
+  stop_container
+  start_container "$@"
+}
+
+status_container() {
+  require_docker
+
+  if ! container_exists; then
+    info "Ollama container does not exist."
+    return
+  fi
+
+  docker ps -a --filter "name=^/${CONTAINER_NAME}$" \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'
+
+  if container_running; then
+    info ""
+    info "API: http://${HOST_BIND}:${HOST_PORT}"
+    if curl -fsS "http://${HOST_BIND}:${HOST_PORT}/api/tags" >/dev/null 2>&1; then
+      info "API health: ok"
+    else
+      info "API health: container is running, but the API is not responding yet"
+    fi
+  fi
+}
+
+logs_container() {
+  require_docker
+  container_exists || die "container '${CONTAINER_NAME}' does not exist"
+  docker logs -f "$CONTAINER_NAME"
+}
+
+pull_model() {
+  local model="${1:-$DEFAULT_MODEL}"
+  require_docker
+  start_container
+  docker exec "$CONTAINER_NAME" ollama pull "$model"
+}
+
+list_common_models() {
+  local i=1
+  for model in "${COMMON_MODELS[@]}"; do
+    printf '%d) %s\n' "$i" "$model"
+    i=$((i + 1))
+  done
+}
+
+choose_model() {
+  require_docker
+  info "Common models:"
+  list_common_models
+  printf 'Choose a model number or type a model tag [%s]: ' "$DEFAULT_MODEL"
+  read -r choice
+
+  local model="$DEFAULT_MODEL"
+  if [ -n "$choice" ]; then
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#COMMON_MODELS[@]}" ]; then
+      model="${COMMON_MODELS[$((choice - 1))]}"
+    else
+      model="$choice"
+    fi
+  fi
+
+  pull_model "$model"
+}
+
+installed_models() {
+  require_docker
+  start_container
+  docker exec "$CONTAINER_NAME" ollama list
+}
+
+show_processes() {
+  require_docker
+  start_container
+  docker exec "$CONTAINER_NAME" ollama ps
+}
+
+remove_container() {
+  require_docker
+  remove_existing_container
+  info "Removed container '${CONTAINER_NAME}'. Model data remains in Docker volume '${VOLUME_NAME}'."
+}
+
+main() {
+  local command="${1:-help}"
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
+
+  case "$command" in
+    start) start_container "$@" ;;
+    stop) stop_container ;;
+    restart) restart_container "$@" ;;
+    status) status_container ;;
+    logs) logs_container ;;
+    pull) pull_model "${1:-}" ;;
+    choose) choose_model ;;
+    models) installed_models ;;
+    ps) show_processes ;;
+    remove) remove_container ;;
+    help|-h|--help) usage ;;
+    *) usage; die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

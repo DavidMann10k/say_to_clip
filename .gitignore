@@ -1,0 +1,7 @@
+.env
+*.log
+*.wav
+recording.txt
+cleaned.txt
+*.secrets
+say_to_clip.env

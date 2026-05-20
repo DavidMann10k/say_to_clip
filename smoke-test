@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_SMOKE_WORKDIR="${XDG_RUNTIME_DIR:-/tmp/say_to_clip-smoke-${UID}}"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  DEFAULT_SMOKE_WORKDIR="${XDG_RUNTIME_DIR}/say_to_clip-smoke"
+fi
+WORKDIR="${DICTATE_SMOKE_WORKDIR:-$DEFAULT_SMOKE_WORKDIR}"
+AUDIO_FILE="${WORKDIR}/smoke.wav"
+
+if ! mkdir -p "$WORKDIR" 2>/dev/null; then
+  if [ -z "${DICTATE_SMOKE_WORKDIR:-}" ] && [ "$WORKDIR" != "/tmp/say_to_clip-smoke-${UID}" ]; then
+    WORKDIR="/tmp/say_to_clip-smoke-${UID}"
+    AUDIO_FILE="${WORKDIR}/smoke.wav"
+    mkdir -p "$WORKDIR"
+  else
+    printf 'error: cannot create smoke workdir: %s\n' "$WORKDIR" >&2
+    exit 1
+  fi
+fi
+chmod 700 "$WORKDIR" 2>/dev/null || true
+
+clean_workdir() {
+  rm -f \
+    "$AUDIO_FILE" \
+    "${WORKDIR}/recording.txt" \
+    "${WORKDIR}/cleaned.txt" \
+    "${WORKDIR}/smoke.txt" \
+    "${WORKDIR}/recording.pid" \
+    "${WORKDIR}/wl-copy.pid" \
+    "${WORKDIR}/dictate.log" \
+    "${WORKDIR}"/groq-*.json \
+    "${WORKDIR}"/ollama-*.json
+}
+
+load_env_file() {
+  local env_file="$1"
+  [ -f "$env_file" ] || return 0
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+}
+
+load_live_config() {
+  load_env_file "${HOME}/.config/say_to_clip/env"
+
+  PROVIDER="${DICTATE_PROVIDER:-local}"
+  TRANSCRIBE_PROVIDER="${DICTATE_TRANSCRIBE_PROVIDER:-$PROVIDER}"
+  CLEAN_PROVIDER="${DICTATE_CLEAN_PROVIDER:-$PROVIDER}"
+  OLLAMA_URL="${DICTATE_OLLAMA_URL:-http://127.0.0.1:11434}"
+  GROQ_API_KEY="${GROQ_API_KEY:-}"
+}
+
+pass() {
+  printf 'ok: %s\n' "$*"
+}
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"
+  pass "found $1"
+}
+
+check_syntax() {
+  bash -n "${ROOT}/ollama-manager"
+  bash -n "${ROOT}/say_to_clip"
+  pass "bash syntax"
+}
+
+check_commands() {
+  need bash
+  need curl
+  need jq
+  need ffmpeg
+  need wl-copy
+
+  case "$TRANSCRIBE_PROVIDER" in
+    local|whisper) need whisper ;;
+    groq) ;;
+    *) fail "unknown transcription provider: $TRANSCRIBE_PROVIDER" ;;
+  esac
+}
+
+check_ollama() {
+  curl -fsS "${OLLAMA_URL}/api/tags" >/dev/null
+  pass "ollama api reachable"
+}
+
+check_provider_endpoints() {
+  printf 'live config: transcription=%s cleanup=%s\n' "$TRANSCRIBE_PROVIDER" "$CLEAN_PROVIDER"
+
+  case "$CLEAN_PROVIDER" in
+    local|ollama) check_ollama ;;
+    groq) [ -n "$GROQ_API_KEY" ] || fail "GROQ_API_KEY is required for Groq cleanup" ;;
+    none|raw) ;;
+    *) fail "unknown cleanup provider: $CLEAN_PROVIDER" ;;
+  esac
+
+  case "$TRANSCRIBE_PROVIDER" in
+    local|whisper) ;;
+    groq) [ -n "$GROQ_API_KEY" ] || fail "GROQ_API_KEY is required for Groq transcription" ;;
+  esac
+}
+
+make_audio() {
+  ffmpeg \
+    -hide_banner \
+    -loglevel error \
+    -y \
+    -f lavfi \
+    -i anullsrc=channel_layout=mono:sample_rate=16000 \
+    -t 0.5 \
+    "$AUDIO_FILE"
+  [ -s "$AUDIO_FILE" ] || fail "failed to create smoke audio"
+  pass "generated smoke audio"
+}
+
+run_dictation_pipeline() {
+  DICTATE_WORKDIR="$WORKDIR" \
+  "${ROOT}/say_to_clip" transcribe "$AUDIO_FILE"
+
+  if [ "${SAY_TO_CLIP_LOG:-0}" = "1" ] || [ "${DICTATE_LOG:-0}" = "1" ]; then
+    [ -f "${WORKDIR}/recording.txt" ] || fail "missing transcript file"
+    [ -s "${WORKDIR}/cleaned.txt" ] || fail "missing cleaned output"
+  else
+    [ ! -f "${WORKDIR}/recording.txt" ] || fail "transcript file should not persist when logging is off"
+    [ ! -f "${WORKDIR}/cleaned.txt" ] || fail "cleaned file should not persist when logging is off"
+  fi
+  pass "dictation pipeline completed"
+}
+
+check_clipboard_process() {
+  local pid_file="${WORKDIR}/wl-copy.pid"
+  [ -f "$pid_file" ] || fail "missing wl-copy pid file"
+
+  local pid
+  pid="$(cat "$pid_file")"
+  kill -0 "$pid" >/dev/null 2>&1 || fail "wl-copy process is not running"
+  pass "clipboard process running"
+}
+
+main() {
+  load_live_config
+  clean_workdir
+  check_syntax
+  check_commands
+  check_provider_endpoints
+  make_audio
+  run_dictation_pipeline
+  check_clipboard_process
+  printf 'smoke test passed\n'
+}
+
+main "$@"

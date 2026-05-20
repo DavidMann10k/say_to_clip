@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+CONFIG_ENV_NAMES=(
+  DICTATE_WORKDIR
+  DICTATE_MIC_SOURCE
+  DICTATE_PROVIDER
+  DICTATE_TRANSCRIBE_PROVIDER
+  DICTATE_CLEAN_PROVIDER
+  SAY_TO_CLIP_MIN_MEAN_VOLUME_DB
+  DICTATE_WHISPER_MODEL
+  DICTATE_WHISPER_LANGUAGE
+  DICTATE_WHISPER_THREADS
+  DICTATE_OLLAMA_URL
+  DICTATE_OLLAMA_MODEL
+  DICTATE_OLLAMA_KEEP_ALIVE
+  DICTATE_GROQ_BASE_URL
+  DICTATE_GROQ_TRANSCRIPTION_ENDPOINT
+  DICTATE_GROQ_CHAT_ENDPOINT
+  DICTATE_GROQ_TRANSCRIPTION_MODEL
+  DICTATE_GROQ_CHAT_MODEL
+  GROQ_API_KEY
+  SAY_TO_CLIP_LOG
+  DICTATE_LOG
+  SAY_TO_CLIP_LOG_CONTENT
+  DICTATE_LOG_CONTENT
+  DICTATE_PROMPT
+)
+
+declare -A ENV_OVERRIDES=()
+
+capture_env_overrides() {
+  local name
+  for name in "${CONFIG_ENV_NAMES[@]}"; do
+    if [ "${!name+x}" = "x" ]; then
+      ENV_OVERRIDES["$name"]="${!name}"
+    fi
+  done
+}
+
+restore_env_overrides() {
+  local name
+  for name in "${!ENV_OVERRIDES[@]}"; do
+    printf -v "$name" '%s' "${ENV_OVERRIDES[$name]}"
+    export "${name?}"
+  done
+}
+
+load_env_file() {
+  local env_file="$1"
+  [ -f "$env_file" ] || return 0
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+}
+
+capture_env_overrides
+if [ "${DICTATE_IGNORE_ENV_FILES:-0}" != "1" ]; then
+  load_env_file "${HOME}/.config/say_to_clip/env"
+fi
+restore_env_overrides
+
+DEFAULT_WORKDIR="${XDG_RUNTIME_DIR:-/tmp/say_to_clip-${UID}}"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  DEFAULT_WORKDIR="${XDG_RUNTIME_DIR}/say_to_clip"
+fi
+
+WORKDIR="${DICTATE_WORKDIR:-$DEFAULT_WORKDIR}"
+STATE_FILE="${WORKDIR}/recording.pid"
+COPY_PID_FILE="${WORKDIR}/wl-copy.pid"
+LOG_FILE="${WORKDIR}/dictate.log"
+AUDIO_FILE="${WORKDIR}/recording.wav"
+TRANSCRIPT_FILE="${WORKDIR}/recording.txt"
+CLEANED_FILE="${WORKDIR}/cleaned.txt"
+
+MIC_SOURCE="${DICTATE_MIC_SOURCE:-@DEFAULT_SOURCE@}"
+PROVIDER="${DICTATE_PROVIDER:-local}"
+TRANSCRIBE_PROVIDER="${DICTATE_TRANSCRIBE_PROVIDER:-$PROVIDER}"
+CLEAN_PROVIDER="${DICTATE_CLEAN_PROVIDER:-$PROVIDER}"
+MIN_MEAN_VOLUME_DB="${SAY_TO_CLIP_MIN_MEAN_VOLUME_DB:--50}"
+WHISPER_MODEL="${DICTATE_WHISPER_MODEL:-base.en}"
+WHISPER_LANGUAGE="${DICTATE_WHISPER_LANGUAGE:-en}"
+WHISPER_THREADS="${DICTATE_WHISPER_THREADS:-0}"
+OLLAMA_URL="${DICTATE_OLLAMA_URL:-http://127.0.0.1:11434}"
+OLLAMA_MODEL="${DICTATE_OLLAMA_MODEL:-gemma3:12b}"
+OLLAMA_KEEP_ALIVE="${DICTATE_OLLAMA_KEEP_ALIVE:-30m}"
+GROQ_BASE_URL="${DICTATE_GROQ_BASE_URL:-https://api.groq.com/openai/v1}"
+GROQ_TRANSCRIPTION_ENDPOINT="${DICTATE_GROQ_TRANSCRIPTION_ENDPOINT:-${GROQ_BASE_URL}/audio/transcriptions}"
+GROQ_CHAT_ENDPOINT="${DICTATE_GROQ_CHAT_ENDPOINT:-${GROQ_BASE_URL}/chat/completions}"
+GROQ_TRANSCRIPTION_MODEL="${DICTATE_GROQ_TRANSCRIPTION_MODEL:-whisper-large-v3-turbo}"
+GROQ_CHAT_MODEL="${DICTATE_GROQ_CHAT_MODEL:-llama-3.3-70b-versatile}"
+GROQ_API_KEY="${GROQ_API_KEY:-}"
+LOG_ENABLED="${SAY_TO_CLIP_LOG:-${DICTATE_LOG:-0}}"
+LOG_CONTENT="${SAY_TO_CLIP_LOG_CONTENT:-${DICTATE_LOG_CONTENT:-0}}"
+PROMPT="${DICTATE_PROMPT:-Clean up this voice transcript without summarizing it. Preserve every substantive word, sentence, exclamation, and non sequitur in the same order. Remove only standalone filler words such as um, uh, and like when they do not change meaning. Fix grammar, capitalization, and punctuation. Do not answer questions in the transcript. Do not omit profanity, jokes, or abrupt final words. Output only the cleaned transcript, no explanations.}"
+CLEAN_ON_ERROR=0
+
+ensure_workdir() {
+  if mkdir -p "$WORKDIR" 2>/dev/null; then
+    chmod 700 "$WORKDIR" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ -z "${DICTATE_WORKDIR:-}" ] && [ "$WORKDIR" != "/tmp/say_to_clip-${UID}" ]; then
+    WORKDIR="/tmp/say_to_clip-${UID}"
+    STATE_FILE="${WORKDIR}/recording.pid"
+    COPY_PID_FILE="${WORKDIR}/wl-copy.pid"
+    LOG_FILE="${WORKDIR}/dictate.log"
+    AUDIO_FILE="${WORKDIR}/recording.wav"
+    TRANSCRIPT_FILE="${WORKDIR}/recording.txt"
+    CLEANED_FILE="${WORKDIR}/cleaned.txt"
+    mkdir -p "$WORKDIR"
+    chmod 700 "$WORKDIR" 2>/dev/null || true
+    return 0
+  fi
+
+  printf 'error: cannot create runtime directory: %s\n' "$WORKDIR" >&2
+  exit 1
+}
+
+ensure_workdir
+
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+logging_enabled() {
+  truthy "$LOG_ENABLED"
+}
+
+content_logging_enabled() {
+  truthy "$LOG_CONTENT"
+}
+
+log() {
+  logging_enabled || return 0
+  printf '[%s] %s\n' "$(date --iso-8601=seconds)" "$*" >>"$LOG_FILE"
+}
+
+now_ms() {
+  date +%s%3N
+}
+
+elapsed_ms() {
+  local start_ms="$1"
+  printf '%s' "$(( $(now_ms) - start_ms ))"
+}
+
+say() {
+  printf '%s\n' "$*"
+  log "$*"
+}
+
+log_content_block() {
+  content_logging_enabled || return 0
+  local label="$1"
+  local text="$2"
+
+  log "${label}:"
+  log '"""'
+  while IFS= read -r line; do
+    log "$line"
+  done <<<"$text"
+  log '"""'
+}
+
+log_content_json_block() {
+  content_logging_enabled || return 0
+  local label="$1"
+  local json="$2"
+
+  log "${label}:"
+  log '```json'
+  if command -v jq >/dev/null 2>&1 && jq -e . >/dev/null 2>&1 <<<"$json"; then
+    jq . <<<"$json" | while IFS= read -r line; do
+      log "$line"
+    done
+  else
+    while IFS= read -r line; do
+      log "$line"
+    done <<<"$json"
+  fi
+  log '```'
+}
+
+cleanup_runtime_files() {
+  logging_enabled && return 0
+  rm -f "$AUDIO_FILE" "$TRANSCRIPT_FILE" "$CLEANED_FILE"
+}
+
+api_error_message() {
+  local response="$1"
+  local message
+
+  message="$(jq -r '.error.message // .message // empty' <<<"$response" 2>/dev/null || true)"
+  if [ -n "$message" ]; then
+    printf ': %s' "$message"
+  fi
+}
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Dictation" "$*" >/dev/null 2>&1 || true
+  fi
+}
+
+die() {
+  say "error: $*"
+  notify "Error: $*"
+  if [ "$CLEAN_ON_ERROR" = "1" ]; then
+    cleanup_runtime_files
+  fi
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  ./say_to_clip [--log] [--log-content] COMMAND
+  ./say_to_clip start
+  ./say_to_clip stop
+  ./say_to_clip toggle
+  ./say_to_clip status
+  ./say_to_clip transcribe FILE
+  ./say_to_clip help
+
+Environment:
+  DICTATE_MIC_SOURCE      ${MIC_SOURCE}
+  DICTATE_PROVIDER        ${PROVIDER}
+  DICTATE_TRANSCRIBE_PROVIDER ${TRANSCRIBE_PROVIDER}
+  DICTATE_CLEAN_PROVIDER  ${CLEAN_PROVIDER}
+  DICTATE_WHISPER_MODEL   ${WHISPER_MODEL}
+  DICTATE_WHISPER_LANGUAGE ${WHISPER_LANGUAGE}
+  DICTATE_WHISPER_THREADS ${WHISPER_THREADS}
+  DICTATE_OLLAMA_URL      ${OLLAMA_URL}
+  DICTATE_OLLAMA_MODEL    ${OLLAMA_MODEL}
+  DICTATE_OLLAMA_KEEP_ALIVE ${OLLAMA_KEEP_ALIVE}
+  DICTATE_GROQ_BASE_URL   ${GROQ_BASE_URL}
+  DICTATE_GROQ_TRANSCRIPTION_MODEL ${GROQ_TRANSCRIPTION_MODEL}
+  DICTATE_GROQ_CHAT_MODEL ${GROQ_CHAT_MODEL}
+  DICTATE_WORKDIR         ${WORKDIR}
+  SAY_TO_CLIP_LOG         ${LOG_ENABLED}
+  SAY_TO_CLIP_LOG_CONTENT ${LOG_CONTENT}
+  SAY_TO_CLIP_MIN_MEAN_VOLUME_DB ${MIN_MEAN_VOLUME_DB}
+
+Dependencies:
+  pw-record, curl, jq, wl-copy
+  whisper is required for local transcription
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+require_groq_key() {
+  [ -n "$GROQ_API_KEY" ] || die "GROQ_API_KEY is required for Groq provider; put it in ~/.config/say_to_clip/env"
+}
+
+recording_pid() {
+  if [ -f "$STATE_FILE" ]; then
+    cat "$STATE_FILE"
+  fi
+}
+
+is_recording() {
+  local pid
+  pid="$(recording_pid || true)"
+  [ -n "${pid:-}" ] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+start_recording() {
+  require_command pw-record
+  local target_args=()
+
+  if is_recording; then
+    die "already recording with pid $(recording_pid)"
+  fi
+
+  if [ -n "$MIC_SOURCE" ] && [ "$MIC_SOURCE" != "@DEFAULT_SOURCE@" ]; then
+    target_args=(--target "$MIC_SOURCE")
+  fi
+
+  rm -f "$AUDIO_FILE" "$TRANSCRIPT_FILE" "$CLEANED_FILE"
+  log "--- dictation session start ---"
+  log "config: mic=${MIC_SOURCE}; provider=${PROVIDER}; transcribe_provider=${TRANSCRIBE_PROVIDER}; clean_provider=${CLEAN_PROVIDER}; whisper_model=${WHISPER_MODEL}; whisper_language=${WHISPER_LANGUAGE}; whisper_threads=${WHISPER_THREADS}; ollama_url=${OLLAMA_URL}; ollama_model=${OLLAMA_MODEL}; ollama_keep_alive=${OLLAMA_KEEP_ALIVE}; groq_base_url=${GROQ_BASE_URL}; groq_transcription_model=${GROQ_TRANSCRIPTION_MODEL}; groq_chat_model=${GROQ_CHAT_MODEL}"
+  say "Recording from ${MIC_SOURCE}. Run './say_to_clip stop' to finish."
+  notify "Recording started"
+
+  if logging_enabled; then
+    pw-record \
+      "${target_args[@]}" \
+      --channels 1 \
+      --rate 16000 \
+      "$AUDIO_FILE" \
+      >>"$LOG_FILE" 2>&1 &
+  else
+    pw-record \
+      "${target_args[@]}" \
+      --channels 1 \
+      --rate 16000 \
+      "$AUDIO_FILE" \
+      >/dev/null 2>&1 &
+  fi
+
+  printf '%s\n' "$!" >"$STATE_FILE"
+}
+
+stop_recording() {
+  local pid
+  local stop_start_ms
+  pid="$(recording_pid || true)"
+  [ -n "${pid:-}" ] || die "not recording"
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    rm -f "$STATE_FILE"
+    die "recording process is no longer running; removed stale state"
+  fi
+
+  stop_start_ms="$(now_ms)"
+  say "Stopping recording..."
+  kill -INT "$pid" >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do
+    kill -0 "$pid" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  kill -TERM "$pid" >/dev/null 2>&1 || true
+  log "timing: stop_recording_ms=$(elapsed_ms "$stop_start_ms")"
+
+  rm -f "$STATE_FILE"
+  [ -s "$AUDIO_FILE" ] || die "recording did not create audio"
+  CLEAN_ON_ERROR=1
+  log "audio: file=${AUDIO_FILE}; bytes=$(wc -c <"$AUDIO_FILE")"
+  if command -v ffprobe >/dev/null 2>&1; then
+    log "audio_probe: $(ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "$AUDIO_FILE" | paste -sd ';' -)"
+  fi
+  check_audio_level "$AUDIO_FILE"
+  transcribe_file "$AUDIO_FILE"
+}
+
+check_audio_level() {
+  local audio_file="$1"
+  local volume_output mean_volume
+
+  command -v ffmpeg >/dev/null 2>&1 || return 0
+
+  volume_output="$(ffmpeg -hide_banner -nostats -i "$audio_file" -af volumedetect -f null - 2>&1 || true)"
+  mean_volume="$(awk '/mean_volume:/ { print $(NF-1) }' <<<"$volume_output" | tail -1)"
+  [ -n "$mean_volume" ] || return 0
+
+  log "audio_level: mean_volume_db=${mean_volume}; min_mean_volume_db=${MIN_MEAN_VOLUME_DB}"
+  if awk -v mean="$mean_volume" -v min="$MIN_MEAN_VOLUME_DB" 'BEGIN { exit !(mean < min) }'; then
+    logging_enabled || rm -f "$audio_file"
+    die "recording looks too quiet (${mean_volume} dB); check the selected microphone source"
+  fi
+}
+
+transcribe_file() {
+  local audio_file="$1"
+  local total_start_ms transcribe_start_ms clean_start_ms copy_start_ms
+  require_command curl
+  require_command jq
+  require_command wl-copy
+
+  total_start_ms="$(now_ms)"
+  [ -f "$audio_file" ] || die "audio file not found: $audio_file"
+  case "$audio_file" in
+    "$WORKDIR"/*) CLEAN_ON_ERROR=1 ;;
+  esac
+
+  say "Transcribing with ${TRANSCRIBE_PROVIDER}..."
+  notify "Transcribing"
+  rm -f "$TRANSCRIPT_FILE" "$CLEANED_FILE"
+
+  transcribe_start_ms="$(now_ms)"
+  transcribe_audio "$audio_file"
+  log "timing: transcription_ms=$(elapsed_ms "$transcribe_start_ms")"
+
+  [ -s "$TRANSCRIPT_FILE" ] || die "transcription did not produce transcript text"
+
+  local transcript
+  transcript="$(sed 's/[[:space:]]\+$//' "$TRANSCRIPT_FILE")"
+  [ -n "$transcript" ] || die "transcript was empty"
+  log "transcript: provider=${TRANSCRIBE_PROVIDER}; chars=${#transcript}; lines=$(printf '%s\n' "$transcript" | wc -l)"
+  log_content_block "transcript_text" "$transcript"
+
+  say "Post-processing with ${CLEAN_PROVIDER}..."
+  notify "Cleaning transcript"
+
+  clean_start_ms="$(now_ms)"
+  clean_transcript "$transcript"
+  log "timing: cleanup_ms=$(elapsed_ms "$clean_start_ms")"
+
+  local cleaned
+  cleaned="$(sed 's/[[:space:]]\+$//' "$CLEANED_FILE")"
+  [ -n "$cleaned" ] || die "cleanup returned an empty response"
+  log "cleaned: provider=${CLEAN_PROVIDER}; chars=${#cleaned}; lines=$(printf '%s\n' "$cleaned" | wc -l)"
+  log_content_block "cleaned_text" "$cleaned"
+
+  copy_start_ms="$(now_ms)"
+  copy_text "$cleaned"
+  log "timing: clipboard_ms=$(elapsed_ms "$copy_start_ms")"
+  log_content_block "copied_text" "$cleaned"
+  say "Copied cleaned transcript to clipboard."
+  log "timing: total_post_stop_ms=$(elapsed_ms "$total_start_ms")"
+  log "--- dictation session end ---"
+  cleanup_runtime_files
+  CLEAN_ON_ERROR=0
+  notify "Copied transcript"
+}
+
+transcribe_audio() {
+  local audio_file="$1"
+  case "$TRANSCRIBE_PROVIDER" in
+    local|whisper) transcribe_local "$audio_file" ;;
+    groq) transcribe_groq "$audio_file" ;;
+    *) die "unknown transcription provider: ${TRANSCRIBE_PROVIDER}" ;;
+  esac
+}
+
+transcribe_local() {
+  local audio_file="$1"
+  require_command whisper
+
+  say "Using local Whisper model '${WHISPER_MODEL}'..."
+  log "transcription_request: provider=local; command=whisper; audio=${audio_file}; model=${WHISPER_MODEL}; language=${WHISPER_LANGUAGE}; threads=${WHISPER_THREADS}; output_dir=${WORKDIR}"
+  if content_logging_enabled; then
+    whisper "$audio_file" \
+      --model "$WHISPER_MODEL" \
+      --language "$WHISPER_LANGUAGE" \
+      --fp16 False \
+      --threads "$WHISPER_THREADS" \
+      --output_format txt \
+      --output_dir "$WORKDIR" \
+      > >(tee -a "$LOG_FILE") \
+      2> >(tee -a "$LOG_FILE" >&2)
+  else
+    whisper "$audio_file" \
+      --model "$WHISPER_MODEL" \
+      --language "$WHISPER_LANGUAGE" \
+      --fp16 False \
+      --threads "$WHISPER_THREADS" \
+      --output_format txt \
+      --output_dir "$WORKDIR" \
+      >/dev/null 2>&1
+  fi
+
+  local produced_txt
+  produced_txt="${audio_file%.*}.txt"
+  if [ -f "$produced_txt" ] && [ "$produced_txt" != "$TRANSCRIPT_FILE" ]; then
+    cp "$produced_txt" "$TRANSCRIPT_FILE"
+    case "$produced_txt" in
+      "${WORKDIR}"/*)
+        logging_enabled || rm -f "$produced_txt"
+        ;;
+    esac
+  fi
+}
+
+transcribe_groq() {
+  local audio_file="$1"
+  local response response_file curl_config http_code transcript
+
+  require_groq_key
+  say "Using Groq transcription model '${GROQ_TRANSCRIPTION_MODEL}'..."
+  log "transcription_request: provider=groq; endpoint=${GROQ_TRANSCRIPTION_ENDPOINT}; audio=${audio_file}; bytes=$(wc -c <"$audio_file"); model=${GROQ_TRANSCRIPTION_MODEL}; language=${WHISPER_LANGUAGE}; response_format=json; api_key_present=yes"
+
+  response_file="$(mktemp "${WORKDIR}/groq-transcription-response.XXXXXX.json")"
+  curl_config="$(mktemp "${WORKDIR}/groq-curl.XXXXXX.conf")"
+  printf 'header = "Authorization: Bearer %s"\n' "$GROQ_API_KEY" >"$curl_config"
+  http_code="$(curl -sS -w '%{http_code}' -o "$response_file" --config "$curl_config" "$GROQ_TRANSCRIPTION_ENDPOINT" \
+    -F "file=@${audio_file}" \
+    -F "model=${GROQ_TRANSCRIPTION_MODEL}" \
+    -F "response_format=json" \
+    -F "language=${WHISPER_LANGUAGE}" || printf '000')"
+  rm -f "$curl_config"
+  response="$(cat "$response_file")"
+  rm -f "$response_file"
+  log_content_json_block "groq_transcription_response" "$response"
+  log "groq_transcription_http_status: ${http_code}"
+  [ "${http_code#2}" != "$http_code" ] || die "Groq transcription request failed with HTTP ${http_code}$(api_error_message "$response")"
+
+  transcript="$(jq -r '.text // empty' <<<"$response" | sed 's/[[:space:]]\+$//')"
+  [ -n "$transcript" ] || die "Groq transcription returned an empty response"
+  printf '%s\n' "$transcript" >"$TRANSCRIPT_FILE"
+}
+
+clean_transcript() {
+  local transcript="$1"
+  case "$CLEAN_PROVIDER" in
+    local|ollama) clean_ollama "$transcript" ;;
+    groq) clean_groq "$transcript" ;;
+    none|raw)
+      log "cleanup_request: provider=none; action=copy transcript unchanged"
+      printf '%s\n' "$transcript" >"$CLEANED_FILE"
+      ;;
+    *) die "unknown cleanup provider: ${CLEAN_PROVIDER}" ;;
+  esac
+}
+
+clean_ollama() {
+  local transcript="$1"
+  local payload response response_file http_code cleaned
+
+  say "Using local Ollama model '${OLLAMA_MODEL}'..."
+  log "cleanup_request: provider=ollama; endpoint=${OLLAMA_URL}/api/chat; model=${OLLAMA_MODEL}; keep_alive=${OLLAMA_KEEP_ALIVE}; transcript_chars=${#transcript}; prompt_chars=${#PROMPT}"
+  payload="$(jq -n \
+    --arg model "$OLLAMA_MODEL" \
+    --arg keep_alive "$OLLAMA_KEEP_ALIVE" \
+    --arg content "${PROMPT}"$'\n\n'"Transcript:"$'\n'"${transcript}" \
+    '{model: $model, messages: [{role: "user", content: $content}], stream: false, keep_alive: $keep_alive, options: {temperature: 0}}')"
+  log_content_json_block "ollama_cleanup_payload" "$payload"
+
+  response_file="$(mktemp "${WORKDIR}/ollama-cleanup-response.XXXXXX.json")"
+  http_code="$(curl -sS -w '%{http_code}' -o "$response_file" "${OLLAMA_URL}/api/chat" \
+    -H 'Content-Type: application/json' \
+    -d "$payload" || printf '000')"
+  response="$(cat "$response_file")"
+  rm -f "$response_file"
+  log_content_json_block "ollama_cleanup_response" "$response"
+  log "ollama_cleanup_http_status: ${http_code}"
+  [ "${http_code#2}" != "$http_code" ] || die "Ollama cleanup request failed with HTTP ${http_code}$(api_error_message "$response")"
+
+  cleaned="$(jq -r '.message.content // empty' <<<"$response" | sed 's/[[:space:]]\+$//')"
+  [ -n "$cleaned" ] || die "Ollama returned an empty response"
+  printf '%s\n' "$cleaned" >"$CLEANED_FILE"
+}
+
+clean_groq() {
+  local transcript="$1"
+  local payload response response_file curl_config http_code cleaned
+
+  require_groq_key
+  say "Using Groq cleanup model '${GROQ_CHAT_MODEL}'..."
+  log "cleanup_request: provider=groq; endpoint=${GROQ_CHAT_ENDPOINT}; model=${GROQ_CHAT_MODEL}; transcript_chars=${#transcript}; prompt_chars=${#PROMPT}; api_key_present=yes"
+  payload="$(jq -n \
+    --arg model "$GROQ_CHAT_MODEL" \
+    --arg content "${PROMPT}"$'\n\n'"Transcript:"$'\n'"${transcript}" \
+    '{model: $model, messages: [{role: "user", content: $content}], stream: false, temperature: 0}')"
+  log_content_json_block "groq_cleanup_payload" "$payload"
+
+  response_file="$(mktemp "${WORKDIR}/groq-cleanup-response.XXXXXX.json")"
+  curl_config="$(mktemp "${WORKDIR}/groq-curl.XXXXXX.conf")"
+  printf 'header = "Authorization: Bearer %s"\n' "$GROQ_API_KEY" >"$curl_config"
+  http_code="$(curl -sS -w '%{http_code}' -o "$response_file" --config "$curl_config" "$GROQ_CHAT_ENDPOINT" \
+    -H 'Content-Type: application/json' \
+    -d "$payload" || printf '000')"
+  rm -f "$curl_config"
+  response="$(cat "$response_file")"
+  rm -f "$response_file"
+  log_content_json_block "groq_cleanup_response" "$response"
+  log "groq_cleanup_http_status: ${http_code}"
+  [ "${http_code#2}" != "$http_code" ] || die "Groq cleanup request failed with HTTP ${http_code}$(api_error_message "$response")"
+
+  cleaned="$(jq -r '.choices[0].message.content // empty' <<<"$response" | sed 's/[[:space:]]\+$//')"
+  [ -n "$cleaned" ] || die "Groq cleanup returned an empty response"
+  printf '%s\n' "$cleaned" >"$CLEANED_FILE"
+}
+
+copy_text() {
+  local text="$1"
+  local old_pid
+
+  old_pid="$(cat "$COPY_PID_FILE" 2>/dev/null || true)"
+  log "clipboard_request: chars=${#text}; previous_pid=${old_pid:-none}"
+  if [ -n "${old_pid:-}" ]; then
+    kill "$old_pid" >/dev/null 2>&1 || true
+  fi
+
+  # Keep wl-copy alive so Wayland clipboard content persists without a manager.
+  if logging_enabled; then
+    printf '%s' "$text" | wl-copy --foreground >/dev/null 2>>"$LOG_FILE" &
+  else
+    printf '%s' "$text" | wl-copy --foreground >/dev/null 2>&1 &
+  fi
+  local copy_pid="$!"
+  sleep 0.2
+  kill -0 "$copy_pid" >/dev/null 2>&1 || die "wl-copy failed"
+  printf '%s\n' "$copy_pid" >"$COPY_PID_FILE"
+  log "clipboard_response: wl_copy_pid=${copy_pid}; status=running"
+}
+
+show_status() {
+  if is_recording; then
+    say "recording: yes (pid $(recording_pid))"
+  else
+    say "recording: no"
+  fi
+  say "audio: ${AUDIO_FILE}"
+  say "transcript: ${TRANSCRIPT_FILE}"
+  say "cleaned: ${CLEANED_FILE}"
+  if logging_enabled; then
+    say "log: ${LOG_FILE}"
+  else
+    say "log: disabled"
+  fi
+}
+
+main() {
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --log)
+        LOG_ENABLED=1
+        shift
+        ;;
+      --log-content)
+        LOG_ENABLED=1
+        LOG_CONTENT=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --*)
+        usage
+        die "unknown option: $1"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  local command="${1:-help}"
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
+
+  case "$command" in
+    start) start_recording ;;
+    stop) stop_recording ;;
+    toggle)
+      if is_recording; then
+        stop_recording
+      else
+        start_recording
+      fi
+      ;;
+    status) show_status ;;
+    transcribe) transcribe_file "${1:?missing audio file}" ;;
+    help|-h|--help) usage ;;
+    *) usage; die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"
