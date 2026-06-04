@@ -28,6 +28,9 @@ clean_workdir() {
     "${WORKDIR}/cleaned.txt" \
     "${WORKDIR}/smoke.txt" \
     "${WORKDIR}/recording.pid" \
+    "${WORKDIR}/recording-notification.id" \
+    "${WORKDIR}/recording-light-red.svg" \
+    "${WORKDIR}/recording-light-green.svg" \
     "${WORKDIR}/wl-copy.pid" \
     "${WORKDIR}/dictate.log" \
     "${WORKDIR}"/groq-*.json \

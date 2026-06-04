@@ -27,6 +27,7 @@ This repo is a DIY/reference Linux dictation project, not a packaged product. Ke
 - Keep runtime files private: `umask 077`, `$XDG_RUNTIME_DIR` when available, per-user `/tmp` fallback, and `chmod 700` workdirs.
 - Keep transcript/API payload logging opt-in. `SAY_TO_CLIP_LOG=1` is operational logging; `SAY_TO_CLIP_LOG_CONTENT=1` is sensitive content logging.
 - When logging is off, successful runs should remove recordings, transcripts, cleaned output, and provider response temp files.
+- Preserve notification lifecycle behavior: recording start creates a persistent red-light notification, recording stop dismisses it by ID when supported, progress handoff notifications remain ordinary text notifications, and completion uses the green ready-light notification.
 - Keep clipboard behavior compatible with Wayland: `wl-copy --foreground` stays alive and its pid is stored so later copies can replace it.
 - Do not add product-style install machinery unless the user explicitly asks; this repo is meant as a reference springboard.
 

@@ -71,6 +71,9 @@ fi
 WORKDIR="${DICTATE_WORKDIR:-$DEFAULT_WORKDIR}"
 STATE_FILE="${WORKDIR}/recording.pid"
 COPY_PID_FILE="${WORKDIR}/wl-copy.pid"
+RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification.id"
+RECORDING_ICON_FILE="${WORKDIR}/recording-light-red.svg"
+READY_ICON_FILE="${WORKDIR}/recording-light-green.svg"
 LOG_FILE="${WORKDIR}/dictate.log"
 AUDIO_FILE="${WORKDIR}/recording.wav"
 TRANSCRIPT_FILE="${WORKDIR}/recording.txt"
@@ -108,6 +111,9 @@ ensure_workdir() {
     WORKDIR="/tmp/say_to_clip-${UID}"
     STATE_FILE="${WORKDIR}/recording.pid"
     COPY_PID_FILE="${WORKDIR}/wl-copy.pid"
+    RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification.id"
+    RECORDING_ICON_FILE="${WORKDIR}/recording-light-red.svg"
+    READY_ICON_FILE="${WORKDIR}/recording-light-green.svg"
     LOG_FILE="${WORKDIR}/dictate.log"
     AUDIO_FILE="${WORKDIR}/recording.wav"
     TRANSCRIPT_FILE="${WORKDIR}/recording.txt"
@@ -210,6 +216,99 @@ notify() {
   fi
 }
 
+ensure_notification_icons() {
+  if [ ! -f "$RECORDING_ICON_FILE" ]; then
+    cat >"$RECORDING_ICON_FILE" <<'EOF'
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <radialGradient id="red-light" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#fecaca"/>
+      <stop offset="35%" stop-color="#ef4444"/>
+      <stop offset="100%" stop-color="#991b1b"/>
+    </radialGradient>
+    <filter id="red-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <circle cx="32" cy="32" r="25" fill="#450a0a" opacity="0.35"/>
+  <circle cx="32" cy="32" r="19" fill="url(#red-light)" filter="url(#red-glow)"/>
+  <circle cx="25" cy="24" r="6" fill="#ffffff" opacity="0.65"/>
+</svg>
+EOF
+  fi
+
+  if [ ! -f "$READY_ICON_FILE" ]; then
+    cat >"$READY_ICON_FILE" <<'EOF'
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <radialGradient id="green-light" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#bbf7d0"/>
+      <stop offset="35%" stop-color="#22c55e"/>
+      <stop offset="100%" stop-color="#166534"/>
+    </radialGradient>
+    <filter id="green-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <circle cx="32" cy="32" r="25" fill="#052e16" opacity="0.35"/>
+  <circle cx="32" cy="32" r="19" fill="url(#green-light)" filter="url(#green-glow)"/>
+  <circle cx="25" cy="24" r="6" fill="#ffffff" opacity="0.65"/>
+</svg>
+EOF
+  fi
+}
+
+show_recording_notification() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  ensure_notification_icons
+
+  local id
+  id="$(notify-send -u critical -t 0 -p -i "$RECORDING_ICON_FILE" "Recording" 2>/dev/null || true)"
+  id="${id%%$'\n'*}"
+  case "$id" in
+    ''|*[!0-9]*)
+      notify-send -u critical -t 0 -i "$RECORDING_ICON_FILE" "Recording" >/dev/null 2>&1 || true
+      return 0
+      ;;
+  esac
+
+  printf '%s\n' "$id" >"$RECORDING_NOTIFICATION_ID_FILE"
+  log "notification: recording_id=${id}"
+}
+
+dismiss_recording_notification() {
+  local id
+  id="$(sed -n '1p' "$RECORDING_NOTIFICATION_ID_FILE" 2>/dev/null || true)"
+  rm -f "$RECORDING_NOTIFICATION_ID_FILE"
+
+  case "$id" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+
+  if command -v makoctl >/dev/null 2>&1 && makoctl dismiss -n "$id" -h >/dev/null 2>&1; then
+    log "notification: dismissed recording_id=${id}"
+    return 0
+  fi
+
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -r "$id" -t 1 "Recording stopped" >/dev/null 2>&1 || true
+  fi
+}
+
+notify_ready() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  ensure_notification_icons
+  notify-send -t 5000 -i "$READY_ICON_FILE" "Ready" "Copied transcript" >/dev/null 2>&1 || true
+}
+
 die() {
   say "error: $*"
   notify "Error: $*"
@@ -288,10 +387,10 @@ start_recording() {
   fi
 
   rm -f "$AUDIO_FILE" "$TRANSCRIPT_FILE" "$CLEANED_FILE"
+  dismiss_recording_notification
   log "--- dictation session start ---"
   log "config: mic=${MIC_SOURCE}; provider=${PROVIDER}; transcribe_provider=${TRANSCRIBE_PROVIDER}; clean_provider=${CLEAN_PROVIDER}; whisper_model=${WHISPER_MODEL}; whisper_language=${WHISPER_LANGUAGE}; whisper_threads=${WHISPER_THREADS}; ollama_url=${OLLAMA_URL}; ollama_model=${OLLAMA_MODEL}; ollama_keep_alive=${OLLAMA_KEEP_ALIVE}; groq_base_url=${GROQ_BASE_URL}; groq_transcription_model=${GROQ_TRANSCRIPTION_MODEL}; groq_chat_model=${GROQ_CHAT_MODEL}"
   say "Recording from ${MIC_SOURCE}. Run './say_to_clip stop' to finish."
-  notify "Recording started"
 
   if logging_enabled; then
     pw-record \
@@ -310,6 +409,7 @@ start_recording() {
   fi
 
   printf '%s\n' "$!" >"$STATE_FILE"
+  show_recording_notification
 }
 
 stop_recording() {
@@ -319,11 +419,13 @@ stop_recording() {
   [ -n "${pid:-}" ] || die "not recording"
   if ! kill -0 "$pid" >/dev/null 2>&1; then
     rm -f "$STATE_FILE"
+    dismiss_recording_notification
     die "recording process is no longer running; removed stale state"
   fi
 
   stop_start_ms="$(now_ms)"
   say "Stopping recording..."
+  dismiss_recording_notification
   kill -INT "$pid" >/dev/null 2>&1 || true
   for _ in $(seq 1 40); do
     kill -0 "$pid" >/dev/null 2>&1 || break
@@ -411,7 +513,7 @@ transcribe_file() {
   log "--- dictation session end ---"
   cleanup_runtime_files
   CLEAN_ON_ERROR=0
-  notify "Copied transcript"
+  notify_ready
 }
 
 transcribe_audio() {
