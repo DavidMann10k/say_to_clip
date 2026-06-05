@@ -47,4 +47,4 @@ shellcheck say_to_clip ollama-manager smoke-test
 - Local cleanup issues: check `DICTATE_OLLAMA_URL`, `./ollama-manager status`, and the `/api/tags` health endpoint.
 - Groq issues: check whether `GROQ_API_KEY` is set without displaying it, then inspect HTTP status and redacted error messages.
 - Clipboard issues: check `wl-copy`, the stored `wl-copy.pid`, and whether the foreground process is still alive.
-- Quiet recordings: inspect `SAY_TO_CLIP_MIN_MEAN_VOLUME_DB`, selected `DICTATE_MIC_SOURCE`, and the `ffmpeg volumedetect` mean volume in logs.
+- Quiet recordings: inspect `SAY_TO_CLIP_MIN_MEAN_VOLUME_DB`, `SAY_TO_CLIP_NO_SIGNAL_DB`, `SAY_TO_CLIP_LIVE_LEVEL`, `SAY_TO_CLIP_LEVEL_SAMPLE_SECONDS`, selected `DICTATE_MIC_SOURCE`, live notification status, and the `ffmpeg volumedetect` mean volume in logs. `Mic muted` can mean software mute, hardware mute, powered-off wireless headset, or any signal below the no-signal threshold.

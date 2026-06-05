@@ -59,6 +59,7 @@ This repo includes a Bash implementation named `say_to_clip`. It demonstrates:
 - default microphone support through PipeWire's default source
 - persistent red recording notification and green ready notification when the
   notification daemon supports IDs/icons
+- live microphone level feedback in the recording notification
 - quiet-audio detection before transcription
 - private runtime files under `$XDG_RUNTIME_DIR` or a per-user `/tmp` fallback
 - config defaults in `~/.config/say_to_clip/env`

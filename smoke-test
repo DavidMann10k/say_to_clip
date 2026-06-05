@@ -29,8 +29,14 @@ clean_workdir() {
     "${WORKDIR}/smoke.txt" \
     "${WORKDIR}/recording.pid" \
     "${WORKDIR}/recording-notification.id" \
+    "${WORKDIR}/recording-notification-v2.id" \
+    "${WORKDIR}/mic-level-monitor.pid" \
+    "${WORKDIR}/mic-level-monitor-v2.pid" \
+    "${WORKDIR}/mic-level.txt" \
     "${WORKDIR}/recording-light-red.svg" \
     "${WORKDIR}/recording-light-green.svg" \
+    "${WORKDIR}/recording-light-red-large.svg" \
+    "${WORKDIR}/recording-light-green-large.svg" \
     "${WORKDIR}/wl-copy.pid" \
     "${WORKDIR}/dictate.log" \
     "${WORKDIR}"/groq-*.json \
