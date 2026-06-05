@@ -9,6 +9,10 @@ CONFIG_ENV_NAMES=(
   DICTATE_PROVIDER
   DICTATE_TRANSCRIBE_PROVIDER
   DICTATE_CLEAN_PROVIDER
+  SAY_TO_CLIP_LIVE_LEVEL
+  SAY_TO_CLIP_NO_SIGNAL_DB
+  SAY_TO_CLIP_LEVEL_UPDATE_SECONDS
+  SAY_TO_CLIP_LEVEL_SAMPLE_SECONDS
   SAY_TO_CLIP_MIN_MEAN_VOLUME_DB
   DICTATE_WHISPER_MODEL
   DICTATE_WHISPER_LANGUAGE
@@ -71,9 +75,13 @@ fi
 WORKDIR="${DICTATE_WORKDIR:-$DEFAULT_WORKDIR}"
 STATE_FILE="${WORKDIR}/recording.pid"
 COPY_PID_FILE="${WORKDIR}/wl-copy.pid"
-RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification.id"
-RECORDING_ICON_FILE="${WORKDIR}/recording-light-red.svg"
-READY_ICON_FILE="${WORKDIR}/recording-light-green.svg"
+LEGACY_RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification.id"
+RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification-v2.id"
+LEGACY_MIC_LEVEL_MONITOR_PID_FILE="${WORKDIR}/mic-level-monitor.pid"
+MIC_LEVEL_MONITOR_PID_FILE="${WORKDIR}/mic-level-monitor-v2.pid"
+MIC_LEVEL_FILE="${WORKDIR}/mic-level.txt"
+RECORDING_ICON_FILE="${WORKDIR}/recording-light-red-large.svg"
+READY_ICON_FILE="${WORKDIR}/recording-light-green-large.svg"
 LOG_FILE="${WORKDIR}/dictate.log"
 AUDIO_FILE="${WORKDIR}/recording.wav"
 TRANSCRIPT_FILE="${WORKDIR}/recording.txt"
@@ -83,6 +91,10 @@ MIC_SOURCE="${DICTATE_MIC_SOURCE:-@DEFAULT_SOURCE@}"
 PROVIDER="${DICTATE_PROVIDER:-local}"
 TRANSCRIBE_PROVIDER="${DICTATE_TRANSCRIBE_PROVIDER:-$PROVIDER}"
 CLEAN_PROVIDER="${DICTATE_CLEAN_PROVIDER:-$PROVIDER}"
+LIVE_LEVEL_ENABLED="${SAY_TO_CLIP_LIVE_LEVEL:-1}"
+NO_SIGNAL_DB="${SAY_TO_CLIP_NO_SIGNAL_DB:--75}"
+LEVEL_UPDATE_SECONDS="${SAY_TO_CLIP_LEVEL_UPDATE_SECONDS:-0.5}"
+LEVEL_SAMPLE_SECONDS="${SAY_TO_CLIP_LEVEL_SAMPLE_SECONDS:-0.35}"
 MIN_MEAN_VOLUME_DB="${SAY_TO_CLIP_MIN_MEAN_VOLUME_DB:--50}"
 WHISPER_MODEL="${DICTATE_WHISPER_MODEL:-base.en}"
 WHISPER_LANGUAGE="${DICTATE_WHISPER_LANGUAGE:-en}"
@@ -111,9 +123,13 @@ ensure_workdir() {
     WORKDIR="/tmp/say_to_clip-${UID}"
     STATE_FILE="${WORKDIR}/recording.pid"
     COPY_PID_FILE="${WORKDIR}/wl-copy.pid"
-    RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification.id"
-    RECORDING_ICON_FILE="${WORKDIR}/recording-light-red.svg"
-    READY_ICON_FILE="${WORKDIR}/recording-light-green.svg"
+    LEGACY_RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification.id"
+    RECORDING_NOTIFICATION_ID_FILE="${WORKDIR}/recording-notification-v2.id"
+    LEGACY_MIC_LEVEL_MONITOR_PID_FILE="${WORKDIR}/mic-level-monitor.pid"
+    MIC_LEVEL_MONITOR_PID_FILE="${WORKDIR}/mic-level-monitor-v2.pid"
+    MIC_LEVEL_FILE="${WORKDIR}/mic-level.txt"
+    RECORDING_ICON_FILE="${WORKDIR}/recording-light-red-large.svg"
+    READY_ICON_FILE="${WORKDIR}/recording-light-green-large.svg"
     LOG_FILE="${WORKDIR}/dictate.log"
     AUDIO_FILE="${WORKDIR}/recording.wav"
     TRANSCRIPT_FILE="${WORKDIR}/recording.txt"
@@ -197,7 +213,7 @@ log_content_json_block() {
 
 cleanup_runtime_files() {
   logging_enabled && return 0
-  rm -f "$AUDIO_FILE" "$TRANSCRIPT_FILE" "$CLEANED_FILE"
+  rm -f "$AUDIO_FILE" "$TRANSCRIPT_FILE" "$CLEANED_FILE" "$MIC_LEVEL_FILE"
 }
 
 api_error_message() {
@@ -212,14 +228,30 @@ api_error_message() {
 
 notify() {
   if command -v notify-send >/dev/null 2>&1; then
-    notify-send "Dictation" "$*" >/dev/null 2>&1 || true
+    notify-send -a say_to_clip "Dictation" "$*" >/dev/null 2>&1 || true
   fi
+}
+
+escape_notification_markup() {
+  sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g'
+}
+
+notify_error() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+
+  local message="$1"
+  local escaped
+  escaped="$(printf '%s' "$message" | escape_notification_markup)"
+  notify-send -a say_to_clip -u critical "Dictation" "<span foreground=\"#ef4444\">${escaped}</span>" >/dev/null 2>&1 || true
 }
 
 ensure_notification_icons() {
   if [ ! -f "$RECORDING_ICON_FILE" ]; then
     cat >"$RECORDING_ICON_FILE" <<'EOF'
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
     <radialGradient id="red-light" cx="35%" cy="30%" r="70%">
       <stop offset="0%" stop-color="#fecaca"/>
@@ -227,23 +259,23 @@ ensure_notification_icons() {
       <stop offset="100%" stop-color="#991b1b"/>
     </radialGradient>
     <filter id="red-glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feGaussianBlur stdDeviation="8" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
   </defs>
-  <circle cx="32" cy="32" r="25" fill="#450a0a" opacity="0.35"/>
-  <circle cx="32" cy="32" r="19" fill="url(#red-light)" filter="url(#red-glow)"/>
-  <circle cx="25" cy="24" r="6" fill="#ffffff" opacity="0.65"/>
+  <circle cx="64" cy="64" r="50" fill="#450a0a" opacity="0.35"/>
+  <circle cx="64" cy="64" r="38" fill="url(#red-light)" filter="url(#red-glow)"/>
+  <circle cx="50" cy="48" r="12" fill="#ffffff" opacity="0.65"/>
 </svg>
 EOF
   fi
 
   if [ ! -f "$READY_ICON_FILE" ]; then
     cat >"$READY_ICON_FILE" <<'EOF'
-<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
     <radialGradient id="green-light" cx="35%" cy="30%" r="70%">
       <stop offset="0%" stop-color="#bbf7d0"/>
@@ -251,16 +283,16 @@ EOF
       <stop offset="100%" stop-color="#166534"/>
     </radialGradient>
     <filter id="green-glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feGaussianBlur stdDeviation="8" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
   </defs>
-  <circle cx="32" cy="32" r="25" fill="#052e16" opacity="0.35"/>
-  <circle cx="32" cy="32" r="19" fill="url(#green-light)" filter="url(#green-glow)"/>
-  <circle cx="25" cy="24" r="6" fill="#ffffff" opacity="0.65"/>
+  <circle cx="64" cy="64" r="50" fill="#052e16" opacity="0.35"/>
+  <circle cx="64" cy="64" r="38" fill="url(#green-light)" filter="url(#green-glow)"/>
+  <circle cx="50" cy="48" r="12" fill="#ffffff" opacity="0.65"/>
 </svg>
 EOF
   fi
@@ -270,24 +302,48 @@ show_recording_notification() {
   command -v notify-send >/dev/null 2>&1 || return 0
   ensure_notification_icons
 
+  local body="${1:-Mic monitor starting...}"
+  local formatted_body
+  formatted_body="$(recording_notification_body "$body")"
   local id
-  id="$(notify-send -u critical -t 0 -p -i "$RECORDING_ICON_FILE" "Recording" 2>/dev/null || true)"
+  id="$(notify-send -a say_to_clip -u critical -t 0 -p -i "$RECORDING_ICON_FILE" "Recording" "$formatted_body" 2>/dev/null || true)"
   id="${id%%$'\n'*}"
   case "$id" in
     ''|*[!0-9]*)
-      notify-send -u critical -t 0 -i "$RECORDING_ICON_FILE" "Recording" >/dev/null 2>&1 || true
+      notify-send -a say_to_clip -u critical -t 0 -i "$RECORDING_ICON_FILE" "Recording" "$formatted_body" >/dev/null 2>&1 || true
       return 0
       ;;
   esac
 
+  rm -f "$LEGACY_RECORDING_NOTIFICATION_ID_FILE"
   printf '%s\n' "$id" >"$RECORDING_NOTIFICATION_ID_FILE"
   log "notification: recording_id=${id}"
 }
 
-dismiss_recording_notification() {
-  local id
-  id="$(sed -n '1p' "$RECORDING_NOTIFICATION_ID_FILE" 2>/dev/null || true)"
-  rm -f "$RECORDING_NOTIFICATION_ID_FILE"
+recording_notification_id() {
+  sed -n '1p' "$RECORDING_NOTIFICATION_ID_FILE" 2>/dev/null || true
+}
+
+update_recording_notification() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+
+  local body="$1"
+  local id="${2:-}"
+  local formatted_body
+  if [ -z "$id" ]; then
+    id="$(recording_notification_id)"
+  fi
+  case "$id" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+
+  ensure_notification_icons
+  formatted_body="$(recording_notification_body "$body")"
+  notify-send -a say_to_clip -r "$id" -u critical -t 0 -i "$RECORDING_ICON_FILE" "Recording" "$formatted_body" >/dev/null 2>&1 || true
+}
+
+dismiss_notification_id() {
+  local id="$1"
 
   case "$id" in
     ''|*[!0-9]*) return 0 ;;
@@ -299,19 +355,304 @@ dismiss_recording_notification() {
   fi
 
   if command -v notify-send >/dev/null 2>&1; then
-    notify-send -r "$id" -t 1 "Recording stopped" >/dev/null 2>&1 || true
+    notify-send -a say_to_clip -r "$id" -t 1 "Recording stopped" >/dev/null 2>&1 || true
   fi
+}
+
+dismiss_recording_notification() {
+  local id
+  local legacy_id
+  id="$(recording_notification_id)"
+  legacy_id="$(sed -n '1p' "$LEGACY_RECORDING_NOTIFICATION_ID_FILE" 2>/dev/null || true)"
+  rm -f "$RECORDING_NOTIFICATION_ID_FILE"
+  rm -f "$LEGACY_RECORDING_NOTIFICATION_ID_FILE"
+  dismiss_notification_id "$id"
+  dismiss_notification_id "$legacy_id"
 }
 
 notify_ready() {
   command -v notify-send >/dev/null 2>&1 || return 0
   ensure_notification_icons
-  notify-send -t 5000 -i "$READY_ICON_FILE" "Ready" "Copied transcript" >/dev/null 2>&1 || true
+  notify-send -a say_to_clip -t 5000 -i "$READY_ICON_FILE" "Ready" "Copied transcript" >/dev/null 2>&1 || true
+}
+
+recording_notification_body() {
+  local body="$1"
+
+  printf '<span font_family="monospace">%s</span>' "$body"
+}
+
+mic_level_monitor_enabled() {
+  truthy "$LIVE_LEVEL_ENABLED"
+}
+
+mic_level_monitor_pid() {
+  if [ -f "$MIC_LEVEL_MONITOR_PID_FILE" ]; then
+    cat "$MIC_LEVEL_MONITOR_PID_FILE"
+  elif [ -f "$LEGACY_MIC_LEVEL_MONITOR_PID_FILE" ]; then
+    cat "$LEGACY_MIC_LEVEL_MONITOR_PID_FILE"
+  fi
+}
+
+is_mic_level_monitor_running() {
+  local pid
+  pid="$(mic_level_monitor_pid || true)"
+  [ -n "${pid:-}" ] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+mic_source_is_muted() {
+  local output
+
+  if command -v pactl >/dev/null 2>&1; then
+    output="$(pactl get-source-mute "$MIC_SOURCE" 2>/dev/null || true)"
+    case "$output" in
+      *yes*) return 0 ;;
+    esac
+
+    if [ "$MIC_SOURCE" = "@DEFAULT_SOURCE@" ]; then
+      output="$(pactl get-source-mute @DEFAULT_SOURCE@ 2>/dev/null || true)"
+      case "$output" in
+        *yes*) return 0 ;;
+      esac
+    fi
+  fi
+
+  if command -v wpctl >/dev/null 2>&1; then
+    if [ "$MIC_SOURCE" = "@DEFAULT_SOURCE@" ]; then
+      output="$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null || true)"
+    else
+      output="$(wpctl get-volume "$MIC_SOURCE" 2>/dev/null || true)"
+    fi
+    case "$output" in
+      *MUTED*) return 0 ;;
+    esac
+  fi
+
+  return 1
+}
+
+level_bar() {
+  local level="$1"
+  local width=10
+  local filled
+
+  case "$level" in
+    ''|nan|inf|-inf) filled=0 ;;
+    *)
+      filled="$(awk -v level="$level" -v min="$NO_SIGNAL_DB" -v max=-20 -v width="$width" '
+        BEGIN {
+          if (level < min) level = min
+          if (level > max) level = max
+          printf "%d", ((level - min) / (max - min)) * width
+        }
+      ' 2>/dev/null || printf '0')"
+      ;;
+  esac
+
+  local i
+  for ((i = 0; i < width; i += 1)); do
+    if [ "$i" -lt "$filled" ]; then
+      printf '█'
+    else
+      printf '░'
+    fi
+  done
+}
+
+format_db() {
+  local level="$1"
+
+  case "$level" in
+    ''|nan|inf|-inf) printf -- '-inf' ;;
+    *) awk -v level="$level" 'BEGIN { printf "%.0f", level }' 2>/dev/null || printf -- '-inf' ;;
+  esac
+}
+
+mic_level_notification_body() {
+  local level="$1"
+  local status db bar color
+
+  if mic_source_is_muted; then
+    printf '<span foreground="#ef4444">░░░░░░░░░░</span> Mic muted'
+    return 0
+  fi
+
+  case "$level" in
+    ''|nan|inf|-inf)
+      status="Mic muted"
+      ;;
+    *)
+      if awk -v level="$level" -v floor="$NO_SIGNAL_DB" 'BEGIN { exit !(level <= floor) }'; then
+        status="Mic muted"
+      elif awk -v level="$level" -v quiet="$MIN_MEAN_VOLUME_DB" 'BEGIN { exit !(level < quiet) }'; then
+        status="Mic quiet"
+      else
+        status="Mic live"
+      fi
+      ;;
+  esac
+
+  db="$(format_db "$level")"
+  bar="$(level_bar "$level")"
+  case "$status" in
+    "Mic live") color="#22c55e" ;;
+    *) color="#ef4444" ;;
+  esac
+  printf '<span foreground="%s">%s</span> %s  %s dBFS' "$color" "$bar" "$status" "$db"
+}
+
+mic_level_sample_count() {
+  awk -v seconds="$LEVEL_SAMPLE_SECONDS" 'BEGIN {
+    count = int(16000 * seconds)
+    if (count < 1600) count = 1600
+    printf "%d", count
+  }'
+}
+
+record_mic_level_sample() {
+  local sample_count="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 pw-record "$@" \
+      --channels 1 \
+      --rate 16000 \
+      --format s16 \
+      --raw \
+      --sample-count "$sample_count" \
+      -
+  else
+    pw-record "$@" \
+      --channels 1 \
+      --rate 16000 \
+      --format s16 \
+      --raw \
+      --sample-count "$sample_count" \
+      -
+  fi
+}
+
+capture_mic_level() {
+  local sample_count="$1"
+  shift
+
+  local output status level
+  set +e
+  if logging_enabled; then
+    output="$(record_mic_level_sample "$sample_count" "$@" 2>>"$LOG_FILE" |
+      ffmpeg \
+        -hide_banner \
+        -nostats \
+        -f s16le \
+        -ar 16000 \
+        -ac 1 \
+        -i pipe:0 \
+        -af volumedetect \
+        -f null - 2>&1)"
+  else
+    output="$(record_mic_level_sample "$sample_count" "$@" 2>/dev/null |
+      ffmpeg \
+        -hide_banner \
+        -nostats \
+        -f s16le \
+        -ar 16000 \
+        -ac 1 \
+        -i pipe:0 \
+        -af volumedetect \
+        -f null - 2>&1)"
+  fi
+  status=$?
+  set -e
+
+  level="$(awk '/mean_volume:/ { level=$(NF-1) } END { print level }' <<<"$output")"
+  if [ -n "$level" ]; then
+    printf '%s\n' "$level"
+    return 0
+  fi
+
+  logging_enabled && log "mic_level_monitor: sample produced no level; status=${status}"
+  return 1
+}
+
+monitor_mic_level() {
+  local expected_recording_pid="$1"
+  local notification_id="$2"
+  shift 2
+
+  local monitor_shell_pid="$BASHPID"
+
+  # shellcheck disable=SC2329 # Called indirectly by signal/exit traps below.
+  cleanup_monitor() {
+    trap - INT TERM EXIT
+    pkill -TERM -P "$monitor_shell_pid" >/dev/null 2>&1 || true
+    log "mic_level_monitor: cleanup complete; monitor_shell_pid=${monitor_shell_pid}"
+  }
+
+  trap 'cleanup_monitor; exit 0' INT TERM
+  trap cleanup_monitor EXIT
+
+  : >"$MIC_LEVEL_FILE"
+  local sample_count level body status
+  sample_count="$(mic_level_sample_count)"
+  log "mic_level_monitor: starting sample loop; monitor_shell_pid=${monitor_shell_pid}; recording_pid=${expected_recording_pid}; notification_id=${notification_id}; source=${MIC_SOURCE}; sample_count=${sample_count}; sample_seconds=${LEVEL_SAMPLE_SECONDS}; update_seconds=${LEVEL_UPDATE_SECONDS}; no_signal_db=${NO_SIGNAL_DB}; quiet_db=${MIN_MEAN_VOLUME_DB}"
+
+  while is_recording_session "$expected_recording_pid"; do
+    level="$(capture_mic_level "$sample_count" "$@" || true)"
+    if [ -n "$level" ]; then
+      printf '%s\n' "$level" >"$MIC_LEVEL_FILE"
+      body="$(mic_level_notification_body "$level")"
+      status="$(sed -n '1p' <<<"$body")"
+      update_recording_notification "$body" "$notification_id"
+      log "mic_level_monitor: mean_dbfs=${level}; status=${status}"
+    else
+      update_recording_notification "Mic monitor waiting for level data..." "$notification_id"
+    fi
+
+    sleep "$LEVEL_UPDATE_SECONDS" || break
+  done
+
+  log "mic_level_monitor: sample loop ended"
+}
+
+start_mic_level_monitor() {
+  mic_level_monitor_enabled || return 0
+  command -v ffmpeg >/dev/null 2>&1 || return 0
+  command -v pw-record >/dev/null 2>&1 || return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+
+  local expected_recording_pid notification_id
+  expected_recording_pid="$(recording_pid || true)"
+  notification_id="$(recording_notification_id)"
+  [ -n "$expected_recording_pid" ] || return 0
+  [ -n "$notification_id" ] || return 0
+
+  stop_mic_level_monitor
+  monitor_mic_level "$expected_recording_pid" "$notification_id" "$@" &
+  printf '%s\n' "$!" >"$MIC_LEVEL_MONITOR_PID_FILE"
+  rm -f "$LEGACY_MIC_LEVEL_MONITOR_PID_FILE"
+  log "mic_level_monitor: pid=$!; recording_pid=${expected_recording_pid}; notification_id=${notification_id}"
+}
+
+stop_mic_level_monitor_pid_file() {
+  local pid_file="$1"
+  local pid
+  pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+  rm -f "$pid_file"
+
+  [ -n "${pid:-}" ] || return 0
+  kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
+  log "mic_level_monitor: stopped pid=${pid}"
+}
+
+stop_mic_level_monitor() {
+  stop_mic_level_monitor_pid_file "$MIC_LEVEL_MONITOR_PID_FILE"
+  stop_mic_level_monitor_pid_file "$LEGACY_MIC_LEVEL_MONITOR_PID_FILE"
 }
 
 die() {
   say "error: $*"
-  notify "Error: $*"
+  notify_error "Error: $*"
   if [ "$CLEAN_ON_ERROR" = "1" ]; then
     cleanup_runtime_files
   fi
@@ -334,6 +675,10 @@ Environment:
   DICTATE_PROVIDER        ${PROVIDER}
   DICTATE_TRANSCRIBE_PROVIDER ${TRANSCRIBE_PROVIDER}
   DICTATE_CLEAN_PROVIDER  ${CLEAN_PROVIDER}
+  SAY_TO_CLIP_LIVE_LEVEL  ${LIVE_LEVEL_ENABLED}
+  SAY_TO_CLIP_NO_SIGNAL_DB ${NO_SIGNAL_DB}
+  SAY_TO_CLIP_LEVEL_UPDATE_SECONDS ${LEVEL_UPDATE_SECONDS}
+  SAY_TO_CLIP_LEVEL_SAMPLE_SECONDS ${LEVEL_SAMPLE_SECONDS}
   DICTATE_WHISPER_MODEL   ${WHISPER_MODEL}
   DICTATE_WHISPER_LANGUAGE ${WHISPER_LANGUAGE}
   DICTATE_WHISPER_THREADS ${WHISPER_THREADS}
@@ -374,6 +719,14 @@ is_recording() {
   [ -n "${pid:-}" ] && kill -0 "$pid" >/dev/null 2>&1
 }
 
+is_recording_session() {
+  local expected_pid="$1"
+  local current_pid
+
+  current_pid="$(recording_pid || true)"
+  [ -n "$expected_pid" ] && [ "$current_pid" = "$expected_pid" ] && kill -0 "$expected_pid" >/dev/null 2>&1
+}
+
 start_recording() {
   require_command pw-record
   local target_args=()
@@ -387,6 +740,7 @@ start_recording() {
   fi
 
   rm -f "$AUDIO_FILE" "$TRANSCRIPT_FILE" "$CLEANED_FILE"
+  stop_mic_level_monitor
   dismiss_recording_notification
   log "--- dictation session start ---"
   log "config: mic=${MIC_SOURCE}; provider=${PROVIDER}; transcribe_provider=${TRANSCRIBE_PROVIDER}; clean_provider=${CLEAN_PROVIDER}; whisper_model=${WHISPER_MODEL}; whisper_language=${WHISPER_LANGUAGE}; whisper_threads=${WHISPER_THREADS}; ollama_url=${OLLAMA_URL}; ollama_model=${OLLAMA_MODEL}; ollama_keep_alive=${OLLAMA_KEEP_ALIVE}; groq_base_url=${GROQ_BASE_URL}; groq_transcription_model=${GROQ_TRANSCRIPTION_MODEL}; groq_chat_model=${GROQ_CHAT_MODEL}"
@@ -410,6 +764,7 @@ start_recording() {
 
   printf '%s\n' "$!" >"$STATE_FILE"
   show_recording_notification
+  start_mic_level_monitor "${target_args[@]}"
 }
 
 stop_recording() {
@@ -419,12 +774,14 @@ stop_recording() {
   [ -n "${pid:-}" ] || die "not recording"
   if ! kill -0 "$pid" >/dev/null 2>&1; then
     rm -f "$STATE_FILE"
+    stop_mic_level_monitor
     dismiss_recording_notification
     die "recording process is no longer running; removed stale state"
   fi
 
   stop_start_ms="$(now_ms)"
   say "Stopping recording..."
+  stop_mic_level_monitor
   dismiss_recording_notification
   kill -INT "$pid" >/dev/null 2>&1 || true
   for _ in $(seq 1 40); do
@@ -700,6 +1057,11 @@ show_status() {
     say "log: ${LOG_FILE}"
   else
     say "log: disabled"
+  fi
+  if is_mic_level_monitor_running; then
+    say "mic level monitor: yes (pid $(mic_level_monitor_pid))"
+  else
+    say "mic level monitor: no"
   fi
 }
 
