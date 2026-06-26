@@ -26,6 +26,52 @@ If you want to build your own version, hand this brief to your coding agent:
 That brief is the main artifact. The code in this repo is one implementation of
 the idea, not the canonical product.
 
+## Omarchy Quick Install
+
+This repo is still a reference project, but an Omarchy/Hyprland machine can use
+the included bootstrap scripts to get the example running quickly.
+
+Install the Arch packages for the local path:
+
+```bash
+sudo pacman -S --needed jq ffmpeg wl-clipboard pipewire libnotify python-openai-whisper
+```
+
+Then install the user-level command, config file, and Hyprland shortcuts:
+
+```bash
+./scripts/install-omarchy
+./scripts/doctor
+./smoke-test
+```
+
+The Omarchy installer links `say_to_clip` into `~/.local/bin`, creates
+`~/.config/say_to_clip/env` when missing, and adds a marked block to
+`~/.config/hypr/bindings.conf`.
+
+Default shortcuts:
+
+```text
+SUPER+R  toggle recording
+F9       hold to record, release to transcribe
+```
+
+The installer configures local Whisper transcription with cleanup disabled:
+
+```bash
+DICTATE_TRANSCRIBE_PROVIDER=local
+DICTATE_CLEAN_PROVIDER=none
+```
+
+That keeps the first install path local and avoids requiring Ollama or Groq just
+to dictate. To enable local LLM cleanup later, install an Ollama package such as
+`ollama`, `ollama-cuda`, `ollama-rocm`, or `ollama-vulkan`, start Ollama, pull a
+model, and set `DICTATE_CLEAN_PROVIDER=local` in
+`~/.config/say_to_clip/env`.
+
+The first local smoke test may download/cache the configured Whisper model, so
+it can take longer than later runs.
+
 ## What To Build
 
 A practical Linux dictation tool needs a few replaceable parts:
@@ -107,6 +153,8 @@ history, a GUI, or cloud providers, revisit the privacy model.
 say_to_clip                         reference Bash implementation
 say_to_clip.env.example             example config defaults
 smoke-test                          live pipeline smoke test
+scripts/doctor                      dependency and config readiness checks
+scripts/install-omarchy             user-level Omarchy/Hyprland bootstrap
 ollama-manager                      optional Dockerized Ollama helper
 local-dictation-agent-brief.md      prompt/brief for building your own version
 ```
@@ -117,8 +165,8 @@ There is no build system. If you change the example scripts, these are the basic
 checks:
 
 ```bash
-bash -n say_to_clip ollama-manager smoke-test
-shellcheck say_to_clip ollama-manager smoke-test
+bash -n say_to_clip ollama-manager smoke-test scripts/doctor scripts/install-omarchy
+shellcheck say_to_clip ollama-manager smoke-test scripts/doctor scripts/install-omarchy
 ```
 
 The smoke test is live. It uses the configured provider path, so it may call

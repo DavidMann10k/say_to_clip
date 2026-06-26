@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+CONFIG_DIR="${CONFIG_HOME}/say_to_clip"
+CONFIG_FILE="${SAY_TO_CLIP_ENV:-${CONFIG_DIR}/env}"
+BIN_DIR="${HOME}/.local/bin"
+HYPR_DIR="${CONFIG_HOME}/hypr"
+BINDINGS_FILE="${SAY_TO_CLIP_HYPR_BINDINGS:-${HYPR_DIR}/bindings.conf}"
+MARKER_START="# say_to_clip dictation begin"
+MARKER_END="# say_to_clip dictation end"
+
+info() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'warn: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  ./scripts/install-omarchy
+
+Installs the reference script for the current user:
+  - links say_to_clip into ~/.local/bin
+  - creates ~/.config/say_to_clip/env when missing
+  - adds Omarchy/Hyprland keybindings to ~/.config/hypr/bindings.conf
+
+Bindings:
+  SUPER+R toggles recording
+  F9 starts recording on press and stops on release
+
+This script does not install system packages. Run ./scripts/doctor for package
+checks and exact Arch package suggestions.
+EOF
+}
+
+config_has_assignment() {
+  local name="$1"
+
+  grep -Eq "^[[:space:]]*${name}[[:space:]]*=" "$CONFIG_FILE"
+}
+
+config_assignment_value() {
+  local name="$1"
+
+  awk -F= -v key="$name" '
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      value = $0
+      sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "", value)
+      gsub(/^["\047]|["\047]$/, "", value)
+      print value
+      exit
+    }
+  ' "$CONFIG_FILE"
+}
+
+append_config_assignment() {
+  local name="$1"
+  local value="$2"
+
+  config_has_assignment "$name" && return 0
+  {
+    printf '\n'
+    printf '# Installed Omarchy default.\n'
+    printf '%s=%s\n' "$name" "$value"
+  } >>"$CONFIG_FILE"
+  info "Added ${name}=${value} to ${CONFIG_FILE}"
+}
+
+install_config() {
+  install -d -m 700 "$CONFIG_DIR"
+
+  if [ ! -f "$CONFIG_FILE" ]; then
+    install -m 600 "${ROOT}/say_to_clip.env.example" "$CONFIG_FILE"
+    info "Created ${CONFIG_FILE}"
+  else
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    info "Keeping existing ${CONFIG_FILE}"
+  fi
+
+  local provider
+  provider="$(config_assignment_value DICTATE_PROVIDER || true)"
+  provider="${provider:-local}"
+
+  if [ "$provider" = "local" ]; then
+    append_config_assignment DICTATE_TRANSCRIBE_PROVIDER local
+    append_config_assignment DICTATE_CLEAN_PROVIDER none
+  else
+    info "DICTATE_PROVIDER=${provider}; leaving split provider settings unchanged"
+  fi
+}
+
+install_commands() {
+  install -d -m 755 "$BIN_DIR"
+  ln -sfn "${ROOT}/say_to_clip" "${BIN_DIR}/say_to_clip"
+  ln -sfn "${ROOT}/ollama-manager" "${BIN_DIR}/say_to_clip_ollama"
+  info "Linked ${BIN_DIR}/say_to_clip"
+  info "Linked ${BIN_DIR}/say_to_clip_ollama"
+}
+
+write_bindings_block() {
+  cat <<EOF
+${MARKER_START}
+unbind = SUPER, R
+unbind = , F9
+bindd = SUPER, R, Toggle dictation, exec, ${BIN_DIR}/say_to_clip toggle
+bindd = , F9, Start dictation (push-to-talk), exec, ${BIN_DIR}/say_to_clip start
+binddr = , F9, Stop dictation (push-to-talk), exec, ${BIN_DIR}/say_to_clip stop
+${MARKER_END}
+EOF
+}
+
+install_bindings() {
+  install -d -m 755 "$HYPR_DIR"
+  [ -f "$BINDINGS_FILE" ] || : >"$BINDINGS_FILE"
+
+  local backup_file
+  backup_file="${BINDINGS_FILE}.bak.say-to-clip-$(date +%Y%m%d%H%M%S)"
+  cp "$BINDINGS_FILE" "$backup_file"
+
+  local filtered_file cleaned_file next_file
+  filtered_file="$(mktemp)"
+  cleaned_file="$(mktemp)"
+  next_file="$(mktemp)"
+
+  awk -v start="$MARKER_START" -v end="$MARKER_END" '
+    $0 == start { skipping = 1; next }
+    $0 == end { skipping = 0; next }
+    !skipping { print }
+  ' "$BINDINGS_FILE" >"$filtered_file"
+
+  awk '
+    /^unbind = SUPER CTRL, X$/ { next }
+    /^unbind = SUPER, R$/ { next }
+    /^unbind = , F9$/ { next }
+    /say_to_clip (toggle|start|stop)$/ { next }
+    { print }
+  ' "$filtered_file" >"$cleaned_file"
+
+  {
+    if [ -s "$cleaned_file" ]; then
+      cat "$cleaned_file"
+      printf '\n'
+    fi
+    write_bindings_block
+  } >"$next_file"
+
+  mv "$next_file" "$BINDINGS_FILE"
+  rm -f "$filtered_file" "$cleaned_file"
+  info "Updated ${BINDINGS_FILE}"
+  info "Backup: ${backup_file}"
+}
+
+reload_hyprland() {
+  local errors
+
+  command -v hyprctl >/dev/null 2>&1 || {
+    warn "hyprctl not found; restart or reload Hyprland manually"
+    return 0
+  }
+
+  if hyprctl reload >/dev/null 2>&1; then
+    info "Reloaded Hyprland"
+  else
+    warn "hyprctl reload failed; restart or reload Hyprland manually"
+    return 0
+  fi
+
+  errors="$(hyprctl configerrors 2>/dev/null || true)"
+  if [ -n "$errors" ]; then
+    warn "Hyprland reported config errors:"
+    printf '%s\n' "$errors" >&2
+  else
+    info "Hyprland config has no reported errors"
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    "")
+      ;;
+    *)
+      usage
+      die "unknown argument: $1"
+      ;;
+  esac
+
+  install_config
+  install_commands
+  install_bindings
+  reload_hyprland
+
+  info ''
+  info "Run ./scripts/doctor to check packages and provider readiness."
+  info "Run ./smoke-test after dependencies are installed."
+}
+
+main "$@"

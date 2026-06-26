@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_FILE="${SAY_TO_CLIP_ENV:-${HOME}/.config/say_to_clip/env}"
+STATUS=0
+declare -a MISSING_ARCH_PACKAGES=()
+
+pass() {
+  printf 'ok: %s\n' "$*"
+}
+
+warn() {
+  printf 'warn: %s\n' "$*" >&2
+}
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  STATUS=1
+}
+
+append_package() {
+  local package="$1"
+  local existing
+
+  for existing in "${MISSING_ARCH_PACKAGES[@]}"; do
+    [ "$existing" = "$package" ] && return 0
+  done
+  MISSING_ARCH_PACKAGES+=("$package")
+}
+
+need_command() {
+  local command_name="$1"
+  local arch_package="$2"
+
+  if command -v "$command_name" >/dev/null 2>&1; then
+    pass "found ${command_name}"
+    return 0
+  fi
+
+  fail "missing command: ${command_name}"
+  [ -n "$arch_package" ] && append_package "$arch_package"
+}
+
+optional_command() {
+  local command_name="$1"
+  local arch_package="$2"
+
+  if command -v "$command_name" >/dev/null 2>&1; then
+    pass "found ${command_name}"
+    return 0
+  fi
+
+  warn "missing optional command: ${command_name}"
+  [ -n "$arch_package" ] && append_package "$arch_package"
+}
+
+load_env_file() {
+  local env_file="$1"
+
+  [ -f "$env_file" ] || return 0
+  set -a
+  # shellcheck source=/dev/null
+  source "$env_file"
+  set +a
+}
+
+config_value() {
+  local name="$1"
+  local value="${!name:-}"
+
+  printf '%s' "$value"
+}
+
+check_syntax() {
+  bash -n \
+    "${ROOT}/say_to_clip" \
+    "${ROOT}/ollama-manager" \
+    "${ROOT}/smoke-test" \
+    "${ROOT}/scripts/doctor" \
+    "${ROOT}/scripts/install-omarchy"
+  pass "bash syntax"
+}
+
+check_path() {
+  case ":${PATH}:" in
+    *":${HOME}/.local/bin:"*) pass "~/.local/bin is on PATH" ;;
+    *) warn "~/.local/bin is not on PATH; installed symlinks may not be found from shortcuts" ;;
+  esac
+}
+
+check_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    pass "config file exists: ${CONFIG_FILE}"
+    load_env_file "$CONFIG_FILE"
+  else
+    warn "config file is missing: ${CONFIG_FILE}"
+  fi
+
+  PROVIDER="$(config_value DICTATE_PROVIDER)"
+  PROVIDER="${PROVIDER:-local}"
+  TRANSCRIBE_PROVIDER="$(config_value DICTATE_TRANSCRIBE_PROVIDER)"
+  TRANSCRIBE_PROVIDER="${TRANSCRIBE_PROVIDER:-$PROVIDER}"
+  CLEAN_PROVIDER="$(config_value DICTATE_CLEAN_PROVIDER)"
+  CLEAN_PROVIDER="${CLEAN_PROVIDER:-$PROVIDER}"
+  OLLAMA_URL="$(config_value DICTATE_OLLAMA_URL)"
+  OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
+  WHISPER_MODEL="$(config_value DICTATE_WHISPER_MODEL)"
+  WHISPER_MODEL="${WHISPER_MODEL:-base.en}"
+  GROQ_API_KEY_VALUE="$(config_value GROQ_API_KEY)"
+
+  printf 'config: transcription=%s cleanup=%s whisper_model=%s\n' \
+    "$TRANSCRIBE_PROVIDER" "$CLEAN_PROVIDER" "$WHISPER_MODEL"
+}
+
+check_provider_requirements() {
+  case "$TRANSCRIBE_PROVIDER" in
+    local|whisper)
+      need_command whisper python-openai-whisper
+      ;;
+    groq)
+      [ -n "$GROQ_API_KEY_VALUE" ] || fail "GROQ_API_KEY is required for Groq transcription"
+      ;;
+    *)
+      fail "unknown transcription provider: ${TRANSCRIBE_PROVIDER}"
+      ;;
+  esac
+
+  case "$CLEAN_PROVIDER" in
+    local|ollama)
+      if curl -fsS "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
+        pass "Ollama API reachable at ${OLLAMA_URL}"
+      else
+        fail "Ollama cleanup is configured, but ${OLLAMA_URL}/api/tags is not reachable"
+        append_package ollama
+      fi
+      ;;
+    groq)
+      [ -n "$GROQ_API_KEY_VALUE" ] || fail "GROQ_API_KEY is required for Groq cleanup"
+      ;;
+    none|raw)
+      pass "cleanup provider does not require an LLM"
+      ;;
+    *)
+      fail "unknown cleanup provider: ${CLEAN_PROVIDER}"
+      ;;
+  esac
+}
+
+check_hyprland() {
+  local bindings_file="${XDG_CONFIG_HOME:-${HOME}/.config}/hypr/bindings.conf"
+
+  if command -v hyprctl >/dev/null 2>&1; then
+    pass "found hyprctl"
+    local hypr_errors hypr_status
+    set +e
+    hypr_errors="$(hyprctl configerrors 2>&1)"
+    hypr_status=$?
+    set -e
+    if [ "$hypr_status" -eq 0 ]; then
+      pass "Hyprland config can be queried"
+    elif [ -n "$hypr_errors" ]; then
+      warn "hyprctl configerrors failed: $(printf '%s\n' "$hypr_errors" | sed -n '1p')"
+    else
+      warn "hyprctl is installed, but Hyprland config could not be queried"
+    fi
+  else
+    warn "hyprctl not found; Omarchy/Hyprland shortcut install cannot be validated"
+  fi
+
+  if [ -f "$bindings_file" ]; then
+    pass "Hyprland bindings file exists: ${bindings_file}"
+  else
+    warn "Hyprland bindings file is missing: ${bindings_file}"
+  fi
+}
+
+print_package_guidance() {
+  [ "${#MISSING_ARCH_PACKAGES[@]}" -gt 0 ] || return 0
+
+  printf '\nArch package command for missing pieces:\n'
+  printf '  sudo pacman -S --needed'
+  printf ' %s' "${MISSING_ARCH_PACKAGES[@]}"
+  printf '\n'
+
+  if printf '%s\n' "${MISSING_ARCH_PACKAGES[@]}" | grep -qx ollama; then
+    printf '\nOllama is optional if DICTATE_CLEAN_PROVIDER=none or groq.\n'
+    printf 'GPU variants are available as ollama-cuda, ollama-rocm, or ollama-vulkan.\n'
+  fi
+}
+
+main() {
+  check_syntax
+  check_path
+  check_config
+
+  need_command bash bash
+  need_command curl curl
+  need_command jq jq
+  need_command ffmpeg ffmpeg
+  need_command wl-copy wl-clipboard
+  need_command pw-record pipewire
+  optional_command notify-send libnotify
+
+  check_provider_requirements
+  check_hyprland
+  print_package_guidance
+
+  if [ "$STATUS" -eq 0 ]; then
+    printf 'doctor passed\n'
+  fi
+  exit "$STATUS"
+}
+
+main "$@"
